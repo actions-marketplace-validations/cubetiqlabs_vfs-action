@@ -1,0 +1,22 @@
+{
+  "name": "@cubis/vfs-action",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GitHub Action for signed VFS software releases",
+  "scripts": {
+    "build": "bun build ./src/main.ts --target=node --format=cjs --minify --outfile=dist/index.js && node scripts/normalize-bundle.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@actions/core": "^3.0.1",
+    "@cubis/vfsclient": "^0.0.3",
+    "semver": "^7.8.5",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "@types/semver": "^7.7.1",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,44 @@
+name: Publish VFS software release
+description: Upload cross-platform artifacts and publish a signed VFS release manifest
+inputs:
+  endpoint:
+    description: VFS Server base URL
+    required: true
+  api-key:
+    description: Bucket-scoped VFS API key
+    required: true
+  signing-key:
+    description: Base64url Ed25519 seed stored as a GitHub secret
+    required: true
+  bucket:
+    description: VFS bucket ID
+    required: true
+  app:
+    description: Application slug
+    required: true
+  channel:
+    description: Update channel
+    required: false
+    default: stable
+  version:
+    description: SemVer release version; defaults to the tag name without its leading v
+    required: false
+  files:
+    description: Multiline list of file paths or glob patterns to upload (e.g. dist/*.exe)
+    required: false
+  assets-file:
+    description: Optional YAML mapping of local files to OS, architecture, and asset kind
+    required: false
+  notes:
+    description: Optional release notes; defaults to GitHub release body if available
+    required: false
+outputs:
+  manifest-url:
+    description: Public JSON manifest URL
+  version:
+    description: Published SemVer version
+  release-id:
+    description: Unique release identifier (bucket:app:version)
+runs:
+  using: node24
+  main: dist/index.js
