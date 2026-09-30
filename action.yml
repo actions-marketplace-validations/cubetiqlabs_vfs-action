@@ -1,5 +1,8 @@
 name: Publish VFS software release
 description: Upload cross-platform artifacts and publish a signed VFS release manifest
+branding:
+  icon: upload-cloud
+  color: purple
 inputs:
   endpoint:
     description: VFS Server base URL
