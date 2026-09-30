@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/build-artifacts.sh
-      - uses: cubetiqlabs/vfs-server/packages/vfs-action@<pinned-commit-or-tag>
+      - uses: cubetiqlabs/vfs-action@v0.1.0
         id: vfs
         with:
           endpoint: https://vfs.example.com
