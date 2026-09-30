@@ -33,7 +33,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: ./scripts/build-artifacts.sh
       - uses: cubetiqlabs/vfs-action@v0.1.0
         id: vfs
