@@ -26,7 +26,7 @@ jobs:
       - run: ./scripts/build.sh # produces next-build.tgz
       - name: Upload build artifact
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-        uses: cubetiqlabs/vfs-action/upload@v0.2.1
+        uses: cubetiqlabs/vfs-action/upload@v0.2.2
         with:
           name: nextjs-build-tar
           path: next-build.tgz
@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download build artifact
-        uses: cubetiqlabs/vfs-action/download@v0.2.1
+        uses: cubetiqlabs/vfs-action/download@v0.2.2
         with:
           name: nextjs-build-tar
           path: .
@@ -56,6 +56,8 @@ Create a bucket-scoped API key with read and write access and store it as the `V
 | `retention-days` | `0` | Days before the server deletes the artifact. `0` uses the bucket default (permanent unless the bucket has a lifecycle TTL). |
 | `compression-level` | `6` | Gzip level 0–9. Use `0` for files that are already compressed, such as a `.tgz`. |
 | `overwrite` | `false` | Replace an artifact of the same name in this run instead of failing. |
+| `part-size-mb` | `16` | Archives larger than this are uploaded in parts of this size. Capped by the server's upload limit. See [Large artifacts](#large-artifacts). |
+| `upload-concurrency` | `3` | Parts uploaded at the same time. |
 | `include-hidden-files` | `false` | Include files and directories whose names start with a dot. |
 
 Outputs: `artifact-id`, `artifact-url` (direct download link, empty for an artifact stored in parts) and `artifact-digest` (`sha256:<hex>` of the whole archive).
@@ -64,13 +66,26 @@ The archive is rooted at the least common ancestor of the search paths, as with 
 
 ### Large artifacts
 
-VFS Server refuses a request bigger than its upload limit (`UPLOAD_ALLOW_SIZE`, or the storage setting in the console), which is why a big archive fails with `file is N bytes, over the M byte upload limit`. The upload Action asks the server for that limit and, when the archive is over it, stores the archive as several parts of at most `min(limit, 64 MiB)` and reassembles them on download. Nothing changes in the workflow.
+An archive larger than `part-size-mb` (16 MiB by default) is split into parts that upload three at a time. Nothing changes in the workflow. Small parts matter for two reasons:
 
-- Each part is a separate object, uploaded and retried on its own, so a dropped connection resends one part rather than the archive.
-- Download fetches the parts in order, checks every part and then the whole archive against its SHA-256, and only then extracts.
-- An artifact is visible only when all its parts are stored. If an upload fails, the parts already stored are deleted. Replacing an artifact removes the objects it supersedes, including leftover parts of a larger earlier upload.
-- Every part counts as a file against the bucket's file and storage quotas, and the upload stops before sending anything if the bucket cannot hold them all.
-- The VFS resumable session API is not used: it enforces the same upload limit and cannot carry an artifact name, run or retention. To store files over the limit as a single object, raise the server limit instead.
+- A proxy such as Cloudflare gives up on a request after 100 seconds (`524: A timeout occurred`). One big request can easily exceed that, while a 16 MiB part does not.
+- VFS Server refuses a request bigger than its upload limit (`UPLOAD_ALLOW_SIZE`), which is why a big archive fails with `file is N bytes, over the M byte upload limit`. Parts never exceed that limit; the Action asks the server for it.
+
+How the upload stays reliable:
+
+- **No blind retries.** When a request ends in a gateway timeout, the origin has often received the whole part and finishes it moments later. The Action waits for the part to appear on the server, matching its checksum, instead of sending it again and racing the first request. It waits up to two minutes for a `504`, `524` or its own timeout, ten seconds for a `502` or a dropped connection, and resends at once when the origin was down or unreachable (`521`-`523`).
+- **Backs off a slow server.** After a gateway timeout the remaining parts upload one at a time.
+- **Bounded requests.** Each request has a timeout sized to its length, so a stalled connection cannot hang the job.
+- **Readable errors.** A proxy's HTML error page is reported as `HTTP 524 (the origin did not answer in time)`.
+
+How integrity is kept:
+
+- Every part is hashed before it is sent and the server confirms that checksum. A part starts with a fixed 4 KiB header naming the artifact, run, attempt and part, so identical slices stay distinct on servers that deduplicate by content hash.
+- When the last part is stored, the Action reads the artifact back and checks every part's ID, size and SHA-256, and the whole archive's, before reporting success.
+- An artifact is visible only when all its parts exist. If the upload fails, in-flight parts are aborted and anything stored under that attempt is deleted. Replacing an artifact removes the objects it supersedes, including leftover parts of a larger earlier upload.
+- Download fetches the parts in order, checks each part and then the whole archive before extracting, and refuses parts that do not belong to the artifact.
+
+Every part counts as a file against the bucket's file and storage quotas, and the upload stops before sending anything if the bucket cannot hold them all. `artifact-url` is empty for an artifact stored in parts. To keep a file as one object, set `part-size-mb` up to the server's limit. The VFS resumable session API is not used: it enforces the same upload limit and cannot carry an artifact name, run or retention.
 
 ### Download
 
@@ -87,7 +102,7 @@ VFS Server refuses a request bigger than its upload limit (`UPLOAD_ALLOW_SIZE`, 
 With no `name`, `artifact-ids` or `pattern`, every artifact of the run is downloaded. The output `download-path` is the absolute destination. Cross-run downloads authenticate with the VFS API key, so no `github-token` is needed:
 
 ```yaml
-- uses: cubetiqlabs/vfs-action/download@v0.2.1
+- uses: cubetiqlabs/vfs-action/download@v0.2.2
   with:
     pattern: build-*
     merge-multiple: true

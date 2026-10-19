@@ -254,3 +254,28 @@ export async function listArtifactFiles(client: VFSClient, bucket: string, scope
 export async function listArtifacts(client: VFSClient, bucket: string, scope: RunScope, name?: string): Promise<ArtifactRecord[]> {
   return groupArtifacts(await listArtifactFiles(client, bucket, scope, name));
 }
+
+// Turns a failed HTTP response into one readable line. A proxy in front of the server answers
+// with a whole HTML error page, which must never end up in a workflow log.
+export function describeFailure(status: number, message: string): string {
+  const hint: Record<number, string> = {
+    408: 'request timeout',
+    413: 'payload too large',
+    429: 'too many requests',
+    502: 'bad gateway',
+    503: 'service unavailable',
+    504: 'gateway timeout',
+    520: 'unknown error from the origin',
+    521: 'origin is down',
+    522: 'connection to the origin timed out',
+    523: 'origin is unreachable',
+    524: 'the origin did not answer in time',
+  };
+  const text = message.trim();
+  if (status > 0 && (/^\s*<|<!doctype|<html/i.test(text) || text === '')) {
+    return `HTTP ${status}${hint[status] ? ` (${hint[status]})` : ''}`;
+  }
+  const oneLine = text.replace(/\s+/g, ' ');
+  const short = oneLine.length > 200 ? `${oneLine.slice(0, 200)}…` : oneLine;
+  return status > 0 ? `HTTP ${status}: ${short}` : short;
+}

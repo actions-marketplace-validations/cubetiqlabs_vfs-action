@@ -463,3 +463,85 @@ describe('artifacts larger than the server upload limit', () => {
     await expect(downloadArtifact({ retryDelayMs: 1 })).rejects.toThrow('does not belong to this artifact');
   });
 });
+
+describe('fast and reliable part uploads', () => {
+  const FAST = { retryDelayMs: 1, recoveryWaitMs: 400, recoveryPollMs: 5 };
+
+  async function send(name: string, content: Buffer, options = {}, extra: Record<string, string> = {}) {
+    await writeFile(path.join(workspace, `${name}.bin`), content);
+    inputs({ ...connection, name, path: `${name}.bin`, 'compression-level': '0', ...extra });
+    return uploadArtifact({ ...FAST, partSizeBytes: 12_000, ...options });
+  }
+
+  async function restore(name: string, dir: string) {
+    inputs({ ...connection, name, path: dir });
+    await downloadArtifact({ retryDelayMs: 1 });
+    return readFile(path.join(workspace, dir, `${name}.bin`));
+  }
+
+  it('splits by part size even when the server would accept one request', async () => {
+    const content = randomBytes(60_000);
+    const uploaded = await send('sized', content);
+    expect(vfs.limit).toBe(0);
+    expect(uploaded!.parts).toBeGreaterThan(4);
+    for (const file of vfs.files) expect(file.size).toBeLessThanOrEqual(12_000);
+    expect(Buffer.compare(await restore('sized', 'out'), content)).toBe(0);
+  });
+
+  it('uploads parts side by side without exceeding the concurrency setting', async () => {
+    vfs.putDelayMs = 15;
+    await send('parallel', randomBytes(80_000), {}, { 'upload-concurrency': '3' });
+    expect(vfs.maxConcurrentPuts).toBeGreaterThan(1);
+    expect(vfs.maxConcurrentPuts).toBeLessThanOrEqual(3);
+
+    vfs.maxConcurrentPuts = 0;
+    await send('serial', randomBytes(40_000), {}, { 'upload-concurrency': '1' });
+    expect(vfs.maxConcurrentPuts).toBe(1);
+  });
+
+  it('does not resend a part that a gateway timeout still let the server store', async () => {
+    vfs.faults = ['store-then-524'];
+    const content = randomBytes(60_000);
+    const uploaded = await send('late', content);
+    expect(vfs.putRequests).toBe(uploaded!.parts);
+    expect(vfs.files).toHaveLength(uploaded!.parts);
+    expect(Buffer.compare(await restore('late', 'out'), content)).toBe(0);
+  });
+
+  it('resends a part the server never stored after a gateway timeout', async () => {
+    vfs.faults = ['524', '502'];
+    const content = randomBytes(60_000);
+    const uploaded = await send('lost', content, { recoveryWaitMs: 30 });
+    expect(vfs.putRequests).toBe(uploaded!.parts + 2);
+    expect(Buffer.compare(await restore('lost', 'out'), content)).toBe(0);
+  });
+
+  it('resends at once when the origin was unreachable, since the request never arrived', async () => {
+    vfs.faults = ['522'];
+    const uploaded = await send('unreachable', randomBytes(30_000), { recoveryWaitMs: 60_000 });
+    expect(vfs.putRequests).toBe(uploaded!.parts + 1);
+  });
+
+  it('reports a persistent gateway timeout in one line and leaves nothing behind', async () => {
+    vfs.faults = ['524', '524', '524', '524'];
+    let message = '';
+    try {
+      await send('dead', randomBytes(60_000), { recoveryWaitMs: 20 }, { 'upload-concurrency': '1' });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain('part 1/');
+    expect(message).toContain('after 4 attempts');
+    expect(message).toContain('HTTP 524');
+    expect(message).not.toContain('<');
+    expect(vfs.files).toHaveLength(0);
+  });
+
+  it('refuses to finish when a stored part has gone missing', async () => {
+    vfs.afterPut = (file) => {
+      if ((file.metadata.vfs_artifact as { parts?: { index: number } }).parts?.index === 2) vfs.files = vfs.files.filter((f) => f !== file);
+    };
+    await expect(send('vanished', randomBytes(60_000))).rejects.toThrow('Verification failed');
+    expect(vfs.files).toHaveLength(0);
+  });
+});

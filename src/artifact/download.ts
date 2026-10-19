@@ -14,6 +14,7 @@ import {
   PART_HEADER_SIZE,
   artifactMetadata,
   decodePartHeader,
+  describeFailure,
   formatBytes,
   groupArtifacts,
   listArtifactFiles,
@@ -69,7 +70,7 @@ async function openDownload(connection: Connection, fileId: string): Promise<Res
     }
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
-      throw new VFSError(detail || res.statusText || `Download failed with status ${res.status}`, { status: res.status });
+      throw new VFSError(describeFailure(res.status, detail || res.statusText), { status: res.status });
     }
     return res;
   }

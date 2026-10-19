@@ -8,15 +8,18 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createClient, readConnection, type Connection } from '../connection';
+import { runPool, type Pool } from './pool';
 import {
   ARCHIVE_CONTENT_TYPE,
   MANIFEST_ENTRY,
   METADATA_KEY,
   PART_HEADER_SIZE,
   artifactMetadata,
+  describeFailure,
   digestOf,
   encodePartHeader,
   formatBytes,
+  groupArtifacts,
   listArtifactFiles,
   listArtifacts,
   logicalKey,
@@ -32,6 +35,11 @@ import { findFilesToUpload } from './search';
 
 export interface UploadOptions {
   retryDelayMs?: number;
+  // Test hooks: a part size below the 1 MiB the input allows, and how long to wait for a part
+  // that a gateway timeout may still have stored.
+  partSizeBytes?: number;
+  recoveryWaitMs?: number;
+  recoveryPollMs?: number;
 }
 
 export interface UploadResult {
@@ -47,12 +55,24 @@ export interface UploadResult {
 
 type NoFilesPolicy = 'warn' | 'error' | 'ignore';
 
-const MAX_UPLOAD_ATTEMPTS = 3;
+const MAX_UPLOAD_ATTEMPTS = 4;
 const MAX_RETENTION_DAYS = 3650;
-// Smaller requests retry cheaply and stay under the request limits of proxies and CDNs in front
-// of the server, so parts never grow past this even when the server would accept more.
-const MAX_PART_BYTES = 64 * 1024 * 1024;
+const MIB = 1024 * 1024;
+// Small requests finish well inside the 100 second limit of a proxy such as Cloudflare, retry
+// cheaply, and upload side by side. An archive bigger than one part is split, even when the
+// server would take it in a single request.
+const DEFAULT_PART_MIB = 16;
+const MAX_PART_MIB = 100;
+const DEFAULT_CONCURRENCY = 3;
+const MAX_CONCURRENCY = 8;
 const MAX_PARTS = 10_000;
+// How long to wait for a part that a gateway timeout may still have stored, polling less often as it goes.
+const RECOVERY_WAIT_MS = 120_000;
+const RECOVERY_POLL_MS = 2_000;
+const RECOVERY_POLL_MAX_MS = 10_000;
+// A request is given at least this long, or enough for a connection of 256 KiB/s.
+const MIN_REQUEST_TIMEOUT_MS = 120_000;
+const SLOWEST_BYTES_PER_SECOND = 256 * 1024;
 
 function parseIntegerInput(name: string, fallback: number, min: number, max: number): number {
   const raw = core.getInput(name).trim();
@@ -106,74 +126,162 @@ async function createArchive(root: string, entries: string[], manifest: string, 
   await pipeline(pack as unknown as NodeJS.ReadableStream, createWriteStream(destination));
 }
 
-function isTransient(error: unknown): boolean {
-  return error instanceof VFSError && (error.status === 0 || error.status === 429 || error.status >= 500);
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function statusOf(error: unknown): number {
+  return error instanceof VFSError ? error.status : -1;
 }
 
-async function putWithRetry(send: () => Promise<AttachmentResponse>, delayMs: number, label: string): Promise<AttachmentResponse> {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await send();
-    } catch (error) {
-      if (attempt >= MAX_UPLOAD_ATTEMPTS || !isTransient(error)) throw error;
-      const wait = delayMs * 2 ** (attempt - 1);
-      core.warning(`Upload of ${label} failed on attempt ${attempt} (${error instanceof Error ? error.message : String(error)}); retrying in ${wait}ms`);
-      await new Promise((resolve) => setTimeout(resolve, wait));
-    }
-  }
+// Worth sending again: the connection dropped, the server or a proxy in front of it was
+// overloaded, or the request timed out.
+function isRetryable(error: unknown): boolean {
+  const status = statusOf(error);
+  return status === 0 || status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
-interface Put {
+// How long to wait for a request whose answer never came, by what the failure says about whether
+// the origin got it. A gateway that timed out waiting (504, 524) or our own timeout means the origin
+// was reached and is probably still working. A dropped connection or a 502 could be either, so
+// give it a moment. When the origin was down or unreachable (521-523) the request never arrived.
+const SHORT_RECOVERY_MS = 10_000;
+function recoveryWindow(error: unknown, full: number): number {
+  const status = statusOf(error);
+  if (status === 504 || status === 524) return full;
+  if (status === 0) return error instanceof Error && /timed out/i.test(error.message) ? full : Math.min(full, SHORT_RECOVERY_MS);
+  if (status === 408 || status === 502 || status === 520) return Math.min(full, SHORT_RECOVERY_MS);
+  return 0;
+}
+
+function isGatewayTimeout(error: unknown): boolean {
+  const status = statusOf(error);
+  return status === 0 || status === 408 || status === 504 || (status >= 522 && status <= 524);
+}
+
+function describe(error: unknown): string {
+  if (error instanceof VFSError) return describeFailure(error.status, error.message);
+  return error instanceof Error ? error.message : String(error);
+}
+
+interface Target {
   key: string;
   filename: string;
   hash: string;
+  size: number;
   contentType: string;
   metadata: ArtifactMetadata;
-  retentionDays: number;
   uploadToken?: string;
   body: () => Readable;
   label: string;
-  retryDelayMs: number;
 }
 
-async function put(client: VFSClient, connection: Connection, p: Put): Promise<AttachmentResponse> {
-  const query = new URLSearchParams({
-    filename: p.filename,
-    file_hash: p.hash,
-    metadata: JSON.stringify({ [METADATA_KEY]: p.metadata }),
-  });
-  if (p.retentionDays > 0) query.set('exp', `${p.retentionDays * 24}h`);
-  if (p.uploadToken) query.set('upload_token', p.uploadToken);
-  const url = `/api/upload/${encodeURIComponent(connection.bucket)}/${p.key}?${query}`;
+interface Context {
+  client: VFSClient;
+  connection: Connection;
+  scope: RunScope;
+  name: string;
+  runAttempt: number;
+  retentionDays: number;
+  retryDelayMs: number;
+  recoveryWaitMs: number;
+  recoveryPollMs: number;
+}
 
-  const uploaded = await putWithRetry(
-    async () => {
-      const body = Readable.toWeb(p.body()) as unknown as ReadableStream<Uint8Array>;
-      const res = await client.http.put<AttachmentResponse>(url, body as BodyInit, {
-        headers: { 'Content-Type': p.contentType },
-        timeout: 0,
-      });
-      return res.data;
-    },
-    p.retryDelayMs,
-    p.label,
-  );
-
+function check(uploaded: AttachmentResponse, t: Target): AttachmentResponse {
   const stored = artifactMetadata(uploaded);
-  const expectedIndex = p.metadata.parts?.index;
   if (
     !uploaded.file_id ||
-    stored?.run_id !== p.metadata.run_id ||
-    stored.repository !== p.metadata.repository ||
-    stored.name !== p.metadata.name ||
-    stored.parts?.index !== expectedIndex
+    stored?.run_id !== t.metadata.run_id ||
+    stored.repository !== t.metadata.repository ||
+    stored.name !== t.metadata.name ||
+    stored.parts?.index !== t.metadata.parts?.index
   ) {
     throw new Error('The VFS server answered with a different stored object than the one that was uploaded');
   }
-  if (uploaded.file_hash && uploaded.file_hash.toLowerCase() !== p.hash) {
+  if (uploaded.file_hash && uploaded.file_hash.toLowerCase() !== t.hash) {
     throw new Error('The VFS server stored different bytes than were uploaded (checksum mismatch)');
   }
   return uploaded;
+}
+
+async function sendOnce(ctx: Context, t: Target, signal?: AbortSignal): Promise<AttachmentResponse> {
+  const query = new URLSearchParams({
+    filename: t.filename,
+    file_hash: t.hash,
+    metadata: JSON.stringify({ [METADATA_KEY]: t.metadata }),
+  });
+  if (ctx.retentionDays > 0) query.set('exp', `${ctx.retentionDays * 24}h`);
+  if (t.uploadToken) query.set('upload_token', t.uploadToken);
+  const url = `/api/upload/${encodeURIComponent(ctx.connection.bucket)}/${t.key}?${query}`;
+  const body = Readable.toWeb(t.body()) as unknown as ReadableStream<Uint8Array>;
+  const res = await ctx.client.http.put<AttachmentResponse>(url, body as BodyInit, {
+    headers: { 'Content-Type': t.contentType },
+    timeout: Math.max(MIN_REQUEST_TIMEOUT_MS, Math.ceil(t.size / SLOWEST_BYTES_PER_SECOND) * 1000),
+    signal,
+  });
+  return check(res.data, t);
+}
+
+// Looks for the object a timed-out request may have left behind: same artifact, attempt, part
+// and, above all, the same bytes.
+async function findStored(ctx: Context, t: Target): Promise<AttachmentResponse | undefined> {
+  const files = await listArtifactFiles(ctx.client, ctx.connection.bucket, ctx.scope, ctx.name);
+  return files.find((file) => {
+    const m = artifactMetadata(file);
+    return (
+      m !== undefined &&
+      m.run_attempt === ctx.runAttempt &&
+      m.parts?.index === t.metadata.parts?.index &&
+      m.parts?.archive_sha256 === t.metadata.parts?.archive_sha256 &&
+      file.file_hash?.toLowerCase() === t.hash
+    );
+  });
+}
+
+// After a gateway gives up, the origin is often still working and finishes the upload a little
+// later. Sending the same bytes again would only race it, so wait for the object to appear.
+async function waitForStored(ctx: Context, t: Target, windowMs: number, signal?: AbortSignal): Promise<AttachmentResponse | undefined> {
+  const deadline = Date.now() + windowMs;
+  let poll = ctx.recoveryPollMs;
+  while (Date.now() < deadline && !signal?.aborted) {
+    await sleep(Math.min(poll, Math.max(0, deadline - Date.now())));
+    try {
+      const found = await findStored(ctx, t);
+      if (found) return check(found, t);
+    } catch {
+      // The server may be busy; keep waiting until the deadline.
+    }
+    poll = Math.min(poll * 1.5, RECOVERY_POLL_MAX_MS);
+  }
+  return undefined;
+}
+
+async function uploadObject(ctx: Context, t: Target, pool?: Pool): Promise<AttachmentResponse> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await sendOnce(ctx, t, pool?.signal);
+    } catch (error) {
+      if (pool?.signal.aborted) throw error;
+      if (!isRetryable(error) || attempt >= MAX_UPLOAD_ATTEMPTS) {
+        throw error instanceof Error && !(error instanceof VFSError)
+          ? error
+          : new Error(`Upload of ${t.label} failed after ${attempt} attempt${attempt > 1 ? 's' : ''}: ${describe(error)}`);
+      }
+      core.warning(`Upload of ${t.label} failed on attempt ${attempt} (${describe(error)})`);
+      if (pool && isGatewayTimeout(error)) {
+        core.warning('The server is slow to answer, so the remaining parts will upload one at a time');
+        pool.limit(1);
+      }
+      const windowMs = recoveryWindow(error, ctx.recoveryWaitMs);
+      if (windowMs > 0) {
+        const found = await waitForStored(ctx, t, windowMs, pool?.signal);
+        if (found) {
+          core.info(`${t.label} was stored despite the failed response; continuing`);
+          return found;
+        }
+      }
+      await sleep(ctx.retryDelayMs * 2 ** (attempt - 1));
+    }
+  }
 }
 
 // Hashes the part header plus one slice of the archive without holding the slice in memory.
@@ -206,6 +314,48 @@ async function removeStale(client: VFSClient, bucket: string, scope: RunScope, n
   }
 }
 
+// Reads the artifact back and confirms every object is there with the size and checksum that was
+// sent, so an upload only counts as done once it can be downloaded complete.
+async function verifyStored(
+  ctx: Context,
+  stored: AttachmentResponse[],
+  expected: Array<{ size: number; digest: string }>,
+  archiveSize: number,
+  archiveHash: string,
+): Promise<void> {
+  const records = await listArtifactsOf(ctx);
+  const record = records.find((r) => r.metadata.run_attempt === ctx.runAttempt && r.parts.length === expected.length);
+  if (!record) throw new Error(`Verification failed: "${ctx.name}" is not fully stored on the server`);
+  if (record.size !== archiveSize || record.digest !== digestOf(archiveHash)) {
+    throw new Error(`Verification failed: the server holds a different archive for "${ctx.name}"`);
+  }
+  record.parts.forEach((part, i) => {
+    if (part.id !== stored[i].file_id || part.size !== expected[i].size || part.digest !== digestOf(expected[i].digest)) {
+      throw new Error(`Verification failed: part ${i + 1} of "${ctx.name}" does not match what was uploaded`);
+    }
+  });
+}
+
+async function listArtifactsOf(ctx: Context) {
+  return groupArtifacts(await listArtifactFiles(ctx.client, ctx.connection.bucket, ctx.scope, ctx.name));
+}
+
+// Deletes the parts this attempt left behind after a failure. Requests that were aborted may still
+// finish on the server, so everything stored under this attempt is removed, not only what was acknowledged.
+async function sweep(ctx: Context): Promise<void> {
+  try {
+    const files = await listArtifactFiles(ctx.client, ctx.connection.bucket, ctx.scope, ctx.name);
+    for (const file of files) {
+      const m = artifactMetadata(file);
+      if (m?.parts && m.run_attempt === ctx.runAttempt) {
+        await ctx.client.deleteFile(ctx.connection.bucket, file.file_id).catch(() => undefined);
+      }
+    }
+  } catch {
+    // Cleanup is best effort: the original error is the one worth reporting.
+  }
+}
+
 export async function uploadArtifact(options: UploadOptions = {}): Promise<UploadResult | undefined> {
   const name = validateArtifactName(core.getInput('name') || 'artifact');
   const patterns = core.getMultilineInput('path');
@@ -217,6 +367,8 @@ export async function uploadArtifact(options: UploadOptions = {}): Promise<Uploa
   const level = parseIntegerInput('compression-level', 6, 0, 9);
   const overwrite = booleanInput('overwrite');
   const includeHidden = booleanInput('include-hidden-files');
+  const partBytes = options.partSizeBytes ?? parseIntegerInput('part-size-mb', DEFAULT_PART_MIB, 1, MAX_PART_MIB) * MIB;
+  const concurrency = parseIntegerInput('upload-concurrency', DEFAULT_CONCURRENCY, 1, MAX_CONCURRENCY);
 
   const connection = readConnection();
   const scope = resolveScope(process.env.GITHUB_REPOSITORY || '', process.env.GITHUB_RUN_ID || '');
@@ -292,90 +444,126 @@ export async function uploadArtifact(options: UploadOptions = {}): Promise<Uploa
     }
 
     const started = Date.now();
-    const retryDelayMs = options.retryDelayMs ?? 1000;
-    const stored: AttachmentResponse[] = [];
+    const ctx: Context = {
+      client,
+      connection,
+      scope,
+      name,
+      runAttempt,
+      retentionDays,
+      retryDelayMs: options.retryDelayMs ?? 1000,
+      recoveryWaitMs: options.recoveryWaitMs ?? RECOVERY_WAIT_MS,
+      recoveryPollMs: options.recoveryPollMs ?? RECOVERY_POLL_MS,
+    };
+    const partLimit = limit > 0 ? Math.min(limit, partBytes) : partBytes;
+    const split = size > partLimit;
+    let stored: AttachmentResponse[];
+    let expected: Array<{ size: number; digest: string }>;
 
-    if (!overLimit) {
-      const uploaded = await put(client, connection, {
-        key: logicalKey(scope, name),
-        filename: storedName(name, scope.runId),
-        hash,
-        contentType: ARCHIVE_CONTENT_TYPE,
-        metadata: baseMetadata,
-        retentionDays,
-        uploadToken: preflight.upload_token,
-        body: () => createReadStream(archive),
-        label: `"${name}"`,
-        retryDelayMs,
-      });
-      stored.push(uploaded);
+    if (!split) {
+      stored = [
+        await uploadObject(ctx, {
+          key: logicalKey(scope, name),
+          filename: storedName(name, scope.runId),
+          hash,
+          size,
+          contentType: ARCHIVE_CONTENT_TYPE,
+          metadata: baseMetadata,
+          uploadToken: preflight.upload_token,
+          body: () => createReadStream(archive),
+          label: `"${name}"`,
+        }),
+      ];
+      expected = [{ size, digest: hash }];
     } else {
-      const partLimit = Math.min(limit, MAX_PART_BYTES);
       if (partLimit <= PART_HEADER_SIZE) {
-        throw new Error(`The server's upload limit of ${limit} bytes is too small to store an artifact in parts`);
+        throw new Error(`The part size of ${partLimit} bytes is too small to store an artifact in parts`);
       }
       const payload = partLimit - PART_HEADER_SIZE;
       const total = Math.ceil(size / payload);
       if (total > MAX_PARTS) {
-        throw new Error(`The archive would need ${total} parts at the server's ${formatBytes(limit)} upload limit; raise the limit or upload less`);
+        throw new Error(`The archive would need ${total} parts of ${formatBytes(partLimit)}; raise part-size-mb`);
       }
-      core.info(`The archive (${formatBytes(size)}) is over the server's ${formatBytes(limit)} upload limit, so it will be uploaded in ${total} parts`);
+      core.info(
+        `Uploading ${formatBytes(size)} as ${total} parts of up to ${formatBytes(partLimit)}, ${Math.min(concurrency, total)} at a time` +
+          (overLimit ? ` (the server's per-upload limit is ${formatBytes(limit)})` : ''),
+      );
 
+      const prepare = async (index: number) => {
+        const start = (index - 1) * payload;
+        const end = Math.min(size, index * payload) - 1;
+        const header = encodePartHeader({ repository: scope.repository, run_id: scope.runId, run_attempt: runAttempt, name, index, total });
+        return { index, start, end, header, hash: await hashPart(archive, header, start, end), size: PART_HEADER_SIZE + (end - start + 1), filename: partName(name, scope.runId, index) };
+      };
+      const approve = async (part: Awaited<ReturnType<typeof prepare>>) => {
+        const answer = await executePreflight(client.http, {
+          bucket_id: connection.bucket,
+          name: part.filename,
+          size: part.size,
+          content_type: 'application/octet-stream',
+          file_hash: part.hash,
+        });
+        if (!answer.allowed) throw new Error(`The VFS server rejected part ${part.index} of ${total}: ${answer.reason || 'not allowed'}`);
+        return answer;
+      };
+
+      // The first part is checked before anything is sent, so a bucket that cannot hold the whole
+      // artifact fails now instead of after most of it has been uploaded.
+      const first = await prepare(1);
+      const firstAnswer = await approve(first);
+      const needed = size + total * PART_HEADER_SIZE;
+      if (firstAnswer.remaining_bytes !== undefined && firstAnswer.remaining_bytes < needed) {
+        throw new Error(`The bucket has ${formatBytes(firstAnswer.remaining_bytes)} of quota left but this artifact needs ${formatBytes(needed)}`);
+      }
+      if (firstAnswer.remaining_files !== undefined && firstAnswer.remaining_files < total) {
+        throw new Error(`The bucket has room for ${firstAnswer.remaining_files} more file(s) but this artifact is stored as ${total} parts`);
+      }
+
+      const sizes: number[] = [];
+      const hashes: string[] = [];
+      let done = 0;
       try {
-        for (let index = 1; index <= total; index++) {
-          const start = (index - 1) * payload;
-          const end = Math.min(size, index * payload) - 1;
-          const header = encodePartHeader({ repository: scope.repository, run_id: scope.runId, run_attempt: runAttempt, name, index, total });
-          const partHash = await hashPart(archive, header, start, end);
-          const partSize = PART_HEADER_SIZE + (end - start + 1);
-          const filename = partName(name, scope.runId, index);
-
-          const check = await executePreflight(client.http, {
-            bucket_id: connection.bucket,
-            name: filename,
-            size: partSize,
-            content_type: 'application/octet-stream',
-            file_hash: partHash,
-          });
-          if (!check.allowed) throw new Error(`The VFS server rejected part ${index} of ${total}: ${check.reason || 'not allowed'}`);
-          if (index === 1) {
-            const needed = size + total * PART_HEADER_SIZE;
-            if (check.remaining_bytes !== undefined && check.remaining_bytes < needed) {
-              throw new Error(`The bucket has ${formatBytes(check.remaining_bytes)} of quota left but this artifact needs ${formatBytes(needed)}`);
-            }
-            if (check.remaining_files !== undefined && check.remaining_files < total) {
-              throw new Error(`The bucket has room for ${check.remaining_files} more file(s) but this artifact is stored as ${total} parts`);
-            }
-          }
-
-          core.info(`Uploading part ${index}/${total} (${formatBytes(partSize)})`);
-          stored.push(
-            await put(client, connection, {
+        stored = await runPool(total, concurrency, async (index, pool) => {
+          const part = index === 1 ? first : await prepare(index);
+          const answer = index === 1 ? firstAnswer : await approve(part);
+          sizes[index - 1] = part.size;
+          hashes[index - 1] = part.hash;
+          const began = Date.now();
+          const uploaded = await uploadObject(
+            ctx,
+            {
               key: partKey(scope, name, index),
-              filename,
-              hash: partHash,
+              filename: part.filename,
+              hash: part.hash,
+              size: part.size,
               contentType: 'application/octet-stream',
               metadata: { ...baseMetadata, parts: { index, total, archive_size: size, archive_sha256: hash } },
-              retentionDays,
-              uploadToken: check.upload_token,
-              body: () => partBody(archive, header, start, end),
+              uploadToken: answer.upload_token,
+              body: () => partBody(archive, part.header, part.start, part.end),
               label: `part ${index}/${total}`,
-              retryDelayMs,
-            }),
+            },
+            pool,
           );
-        }
+          const seconds = Math.max((Date.now() - began) / 1000, 0.001);
+          core.info(`Uploaded part ${index}/${total} (${formatBytes(part.size)}, ${formatBytes(part.size / seconds)}/s), ${++done} of ${total} done`);
+          return uploaded;
+        });
       } catch (error) {
-        // Parts without their siblings are unusable and still count against the bucket.
-        for (const part of stored) {
-          await client.deleteFile(connection.bucket, part.file_id).catch(() => undefined);
-        }
+        await sweep(ctx);
         throw error;
       }
+      expected = sizes.map((partSize, i) => ({ size: partSize, digest: hashes[i] }));
     }
 
+    try {
+      await verifyStored(ctx, stored, expected, size, hash);
+    } catch (error) {
+      await sweep(ctx);
+      throw error;
+    }
     await removeStale(client, connection.bucket, scope, name, new Set(stored.map((file) => file.file_id)));
 
-    const single = stored.length === 1 && !overLimit;
+    const single = !split;
     const result: UploadResult = {
       artifactId: stored[0].file_id,
       artifactUrl: single ? `${connection.endpoint}/v/${encodeURIComponent(connection.bucket)}/${encodeURIComponent(stored[0].file_id)}` : '',

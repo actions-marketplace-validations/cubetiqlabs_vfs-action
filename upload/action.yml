@@ -27,6 +27,14 @@ inputs:
     description: Replace an existing artifact with the same name in this run instead of failing
     required: false
     default: 'false'
+  part-size-mb:
+    description: Archives larger than this are uploaded in parts of this size, several at a time. Capped by the server's upload limit
+    required: false
+    default: '16'
+  upload-concurrency:
+    description: Number of parts to upload at the same time
+    required: false
+    default: '3'
   include-hidden-files:
     description: Include files and directories whose names start with a dot
     required: false
@@ -44,7 +52,7 @@ outputs:
   artifact-id:
     description: ID of the uploaded artifact, usable as artifact-ids when downloading
   artifact-url:
-    description: Direct download URL of the artifact archive. Empty when the artifact was too large for one upload and is stored in parts
+    description: Direct download URL of the artifact archive. Empty when the artifact is stored in several parts
   artifact-digest:
     description: SHA-256 digest of the artifact archive, as sha256:<hex>
 runs:

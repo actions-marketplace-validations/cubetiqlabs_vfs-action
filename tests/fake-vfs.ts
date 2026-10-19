@@ -26,9 +26,24 @@ export interface FakeVFS {
   // Every PUT after this many have been accepted fails with a 503.
   failPutsAfter?: number;
   puts: number;
+  putRequests: number;
+  // Consumed one per PUT, in order. 'store-then-524' keeps the object but answers with a gateway
+  // timeout page, like an origin that finishes after Cloudflare gave up; '524' and '502' store nothing.
+  faults: Array<'store-then-524' | '524' | '522' | '502' | undefined>;
+  putDelayMs: number;
+  concurrentPuts: number;
+  maxConcurrentPuts: number;
+  afterPut?: (file: StoredFile) => void;
   redirectDownloadsTo?: string;
   cdn: Map<string, Uint8Array>;
   fetch: typeof fetch;
+}
+
+function gatewayPage(status: number): Response {
+  return new Response(`<!DOCTYPE html>\n<html class="no-js" lang="en-US"><head><title>cubis.tech | ${status}: A timeout occurred</title></head><body>${status}</body></html>`, {
+    status,
+    headers: { 'Content-Type': 'text/html; charset=UTF-8' },
+  });
 }
 
 function json(value: unknown, status = 200): Response {
@@ -50,42 +65,21 @@ export function createFakeVFS(): FakeVFS {
     dedupe: false,
     limit: 0,
     puts: 0,
+    putRequests: 0,
+    faults: [],
+    putDelayMs: 0,
+    concurrentPuts: 0,
+    maxConcurrentPuts: 0,
     cdn: new Map(),
     fetch: async (input, init) => {
       const url = new URL(String(input instanceof Request ? input.url : input));
       const method = init?.method || 'GET';
       const headers = new Headers(init?.headers);
       fake.requests.push({ method, url, headers });
-
-      if (url.host === 'cdn.example.test') {
-        const bytes = fake.cdn.get(url.pathname);
-        return bytes ? new Response(bytes) : new Response('missing', { status: 404 });
-      }
-      if (url.host !== 'vfs.example.test') throw new Error(`Unexpected host ${url.host}`);
-      if (url.pathname.startsWith('/api/') && headers.get('x-api-key') !== 'test-api-key') return json({ detail: 'unauthorized' }, 401);
-
-      if (url.pathname === '/api/upload' && method === 'GET') {
-        const q = (url.searchParams.get('q') || '').toLowerCase();
-        const page = Number(url.searchParams.get('page') || 1);
-        const limit = Number(url.searchParams.get('limit') || 50);
-        const bucket = url.searchParams.get('bucket_id');
-        const matches = fake.files
-          .filter((f) => f.bucket_id === bucket && (!q || f.name.toLowerCase().includes(q)))
-          .sort((a, b) => b.created_at.localeCompare(a.created_at));
-        return json(matches.slice((page - 1) * limit, page * limit).map(view));
-      }
-      if (url.pathname === '/api/upload/preflight' && method === 'POST') {
-        const body = JSON.parse(String(init?.body));
-        if (fake.limit > 0 && body.size > fake.limit) {
-          return json({ allowed: false, reason: `file is ${body.size} bytes, over the ${fake.limit} byte upload limit`, bucket_id: body.bucket_id, size: body.size, max_upload_bytes: fake.limit });
-        }
-        return json({
-          allowed: true, bucket_id: body.bucket_id, size: body.size, max_upload_bytes: fake.limit, upload_token: 'ticket',
-          ...(fake.remainingBytes !== undefined ? { remaining_bytes: fake.remainingBytes } : {}),
-          ...(fake.remainingFiles !== undefined ? { remaining_files: fake.remainingFiles } : {}),
-        });
-      }
-      if (url.pathname.startsWith('/api/upload/') && method === 'PUT') {
+      async function handlePut(): Promise<Response> {
+        const fault = fake.faults.shift();
+        if (fault === '524' || fault === '522' || fault === '502') return gatewayPage(Number(fault));
+        if (fake.putDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, fake.putDelayMs));
         if (fake.failPutsAfter !== undefined && fake.puts >= fake.failPutsAfter) return json({ detail: 'storage unavailable' }, 503);
         if (fake.failNextPuts > 0) {
           fake.failNextPuts--;
@@ -116,7 +110,49 @@ export function createFakeVFS(): FakeVFS {
         };
         fake.files.push(file);
         fake.puts++;
+        fake.afterPut?.(file);
+        if (fault === 'store-then-524') return gatewayPage(524);
         return json(view(file));
+      }
+
+
+      if (url.host === 'cdn.example.test') {
+        const bytes = fake.cdn.get(url.pathname);
+        return bytes ? new Response(bytes) : new Response('missing', { status: 404 });
+      }
+      if (url.host !== 'vfs.example.test') throw new Error(`Unexpected host ${url.host}`);
+      if (url.pathname.startsWith('/api/') && headers.get('x-api-key') !== 'test-api-key') return json({ detail: 'unauthorized' }, 401);
+
+      if (url.pathname === '/api/upload' && method === 'GET') {
+        const q = (url.searchParams.get('q') || '').toLowerCase();
+        const page = Number(url.searchParams.get('page') || 1);
+        const limit = Number(url.searchParams.get('limit') || 50);
+        const bucket = url.searchParams.get('bucket_id');
+        const matches = fake.files
+          .filter((f) => f.bucket_id === bucket && (!q || f.name.toLowerCase().includes(q)))
+          .sort((a, b) => b.created_at.localeCompare(a.created_at));
+        return json(matches.slice((page - 1) * limit, page * limit).map(view));
+      }
+      if (url.pathname === '/api/upload/preflight' && method === 'POST') {
+        const body = JSON.parse(String(init?.body));
+        if (fake.limit > 0 && body.size > fake.limit) {
+          return json({ allowed: false, reason: `file is ${body.size} bytes, over the ${fake.limit} byte upload limit`, bucket_id: body.bucket_id, size: body.size, max_upload_bytes: fake.limit });
+        }
+        return json({
+          allowed: true, bucket_id: body.bucket_id, size: body.size, max_upload_bytes: fake.limit, upload_token: 'ticket',
+          ...(fake.remainingBytes !== undefined ? { remaining_bytes: fake.remainingBytes } : {}),
+          ...(fake.remainingFiles !== undefined ? { remaining_files: fake.remainingFiles } : {}),
+        });
+      }
+      if (url.pathname.startsWith('/api/upload/') && method === 'PUT') {
+        fake.putRequests++;
+        fake.concurrentPuts++;
+        fake.maxConcurrentPuts = Math.max(fake.maxConcurrentPuts, fake.concurrentPuts);
+        try {
+          return await handlePut();
+        } finally {
+          fake.concurrentPuts--;
+        }
       }
       const unlink = url.pathname.match(/^\/api\/upload\/unlink\/([^/]+)\/([^/]+)$/);
       if (unlink && method === 'DELETE') {
