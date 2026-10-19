@@ -14,6 +14,7 @@ import { parse as parseYaml } from 'yaml';
 import semver from 'semver';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { parseEndpoint } from './connection';
 
 interface AssetMapping {
   path: string;
@@ -164,11 +165,7 @@ async function loadMappings(file: string, workspace: string): Promise<AssetMappi
 }
 
 export async function publish(): Promise<void> {
-  const endpoint = required('endpoint').replace(/\/+$/, '');
-  const endpointURL = new URL(endpoint);
-  if (endpointURL.protocol !== 'https:' || endpointURL.username || endpointURL.password || endpointURL.pathname !== '/' || endpointURL.search || endpointURL.hash) {
-    throw new Error('endpoint must be an HTTPS origin without credentials, a path, or query');
-  }
+  const endpoint = parseEndpoint(required('endpoint'));
   const apiKey = required('api-key');
   const rawSeed = required('signing-key');
   core.setSecret(apiKey);
@@ -294,8 +291,4 @@ export async function publish(): Promise<void> {
   core.setOutput('version', version);
   core.setOutput('release-id', `${bucket}:${app}:${version}`);
   core.info(`Published ${app} ${version}: ${manifestURL}`);
-}
-
-if (process.env.GITHUB_ACTIONS === 'true') {
-  publish().catch((error) => core.setFailed(error instanceof Error ? error.message : String(error)));
 }
