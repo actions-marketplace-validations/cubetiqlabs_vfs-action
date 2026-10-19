@@ -1,0 +1,60 @@
+name: Upload VFS artifact
+description: Upload build artifacts to VFS Server. A drop-in alternative to actions/upload-artifact
+branding:
+  icon: upload-cloud
+  color: purple
+inputs:
+  name:
+    description: Artifact name, unique within the workflow run
+    required: false
+    default: artifact
+  path:
+    description: Files, directories or glob patterns to upload, one per line. Prefix a line with ! to exclude
+    required: true
+  if-no-files-found:
+    description: What to do when no file matches path - warn, error or ignore
+    required: false
+    default: warn
+  retention-days:
+    description: Days to keep the artifact. 0 uses the bucket default
+    required: false
+    default: '0'
+  compression-level:
+    description: Gzip level from 0 (store, best for files that are already compressed) to 9
+    required: false
+    default: '6'
+  overwrite:
+    description: Replace an existing artifact with the same name in this run instead of failing
+    required: false
+    default: 'false'
+  part-size-mb:
+    description: Archives larger than this are uploaded in parts of this size, several at a time. Capped by the server's upload limit
+    required: false
+    default: '16'
+  upload-concurrency:
+    description: Number of parts to upload at the same time
+    required: false
+    default: '3'
+  include-hidden-files:
+    description: Include files and directories whose names start with a dot
+    required: false
+    default: 'false'
+  endpoint:
+    description: VFS Server base URL. Falls back to the VFS_ENDPOINT environment variable
+    required: false
+  api-key:
+    description: Bucket-scoped VFS API key. Falls back to the VFS_API_KEY environment variable
+    required: false
+  bucket:
+    description: VFS bucket ID. Falls back to the VFS_BUCKET environment variable
+    required: false
+outputs:
+  artifact-id:
+    description: ID of the uploaded artifact, usable as artifact-ids when downloading
+  artifact-url:
+    description: Direct download URL of the artifact archive. Empty when the artifact is stored in several parts
+  artifact-digest:
+    description: SHA-256 digest of the artifact archive, as sha256:<hex>
+runs:
+  using: node24
+  main: ../dist/upload/index.js

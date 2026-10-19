@@ -1,0 +1,44 @@
+name: Download VFS artifact
+description: Download build artifacts from VFS Server. A drop-in alternative to actions/download-artifact
+branding:
+  icon: download-cloud
+  color: purple
+inputs:
+  name:
+    description: Name of a single artifact to download. Its files land directly in path
+    required: false
+  artifact-ids:
+    description: Comma or newline separated artifact IDs. Takes precedence over name and pattern
+    required: false
+  pattern:
+    description: Glob matched against artifact names, one per line. Each match goes to path/<artifact name>
+    required: false
+  merge-multiple:
+    description: Extract every matched artifact straight into path instead of one directory each
+    required: false
+    default: 'false'
+  path:
+    description: Destination directory, relative to the workspace
+    required: false
+    default: .
+  run-id:
+    description: Workflow run to download from. Defaults to the current run
+    required: false
+  repository:
+    description: Repository that produced the run, as owner/name. Defaults to the current repository
+    required: false
+  endpoint:
+    description: VFS Server base URL. Falls back to the VFS_ENDPOINT environment variable
+    required: false
+  api-key:
+    description: Bucket-scoped VFS API key. Falls back to the VFS_API_KEY environment variable
+    required: false
+  bucket:
+    description: VFS bucket ID. Falls back to the VFS_BUCKET environment variable
+    required: false
+outputs:
+  download-path:
+    description: Absolute path the artifacts were downloaded to
+runs:
+  using: node24
+  main: ../dist/download/index.js
