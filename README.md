@@ -26,7 +26,7 @@ jobs:
       - run: ./scripts/build.sh # produces next-build.tgz
       - name: Upload build artifact
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-        uses: cubetiqlabs/vfs-action/upload@v0.2.0
+        uses: cubetiqlabs/vfs-action/upload@v0.2.1
         with:
           name: nextjs-build-tar
           path: next-build.tgz
@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download build artifact
-        uses: cubetiqlabs/vfs-action/download@v0.2.0
+        uses: cubetiqlabs/vfs-action/download@v0.2.1
         with:
           name: nextjs-build-tar
           path: .
@@ -58,9 +58,19 @@ Create a bucket-scoped API key with read and write access and store it as the `V
 | `overwrite` | `false` | Replace an artifact of the same name in this run instead of failing. |
 | `include-hidden-files` | `false` | Include files and directories whose names start with a dot. |
 
-Outputs: `artifact-id`, `artifact-url` (direct download link) and `artifact-digest` (`sha256:<hex>`).
+Outputs: `artifact-id`, `artifact-url` (direct download link, empty for an artifact stored in parts) and `artifact-digest` (`sha256:<hex>` of the whole archive).
 
 The archive is rooted at the least common ancestor of the search paths, as with `actions/upload-artifact`: `path: dist` extracts as the contents of `dist`, and `path: next-build.tgz` as `next-build.tgz`. Hidden files are judged below each search path, so naming `.build/` explicitly still uploads it.
+
+### Large artifacts
+
+VFS Server refuses a request bigger than its upload limit (`UPLOAD_ALLOW_SIZE`, or the storage setting in the console), which is why a big archive fails with `file is N bytes, over the M byte upload limit`. The upload Action asks the server for that limit and, when the archive is over it, stores the archive as several parts of at most `min(limit, 64 MiB)` and reassembles them on download. Nothing changes in the workflow.
+
+- Each part is a separate object, uploaded and retried on its own, so a dropped connection resends one part rather than the archive.
+- Download fetches the parts in order, checks every part and then the whole archive against its SHA-256, and only then extracts.
+- An artifact is visible only when all its parts are stored. If an upload fails, the parts already stored are deleted. Replacing an artifact removes the objects it supersedes, including leftover parts of a larger earlier upload.
+- Every part counts as a file against the bucket's file and storage quotas, and the upload stops before sending anything if the bucket cannot hold them all.
+- The VFS resumable session API is not used: it enforces the same upload limit and cannot carry an artifact name, run or retention. To store files over the limit as a single object, raise the server limit instead.
 
 ### Download
 
@@ -77,7 +87,7 @@ The archive is rooted at the least common ancestor of the search paths, as with 
 With no `name`, `artifact-ids` or `pattern`, every artifact of the run is downloaded. The output `download-path` is the absolute destination. Cross-run downloads authenticate with the VFS API key, so no `github-token` is needed:
 
 ```yaml
-- uses: cubetiqlabs/vfs-action/download@v0.2.0
+- uses: cubetiqlabs/vfs-action/download@v0.2.1
   with:
     pattern: build-*
     merge-multiple: true

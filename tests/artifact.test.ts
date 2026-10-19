@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile, chmod } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { randomBytes } from 'node:crypto';
 import * as tar from 'tar';
 import { uploadArtifact } from '../src/artifact/upload';
 import { downloadArtifact } from '../src/artifact/download';
@@ -330,5 +331,135 @@ describe('download-artifact', () => {
     expect(await readFile(path.join(workspace, 'outside.txt'), 'utf8')).toBe('outside');
     await expect(stat(path.join(workspace, 'safe/link'))).rejects.toThrow();
     await expect(stat(path.join(workspace, 'outside.txt.1'))).rejects.toThrow();
+  });
+});
+
+describe('artifacts larger than the server upload limit', () => {
+  const LIMIT = 20_000;
+
+  async function uploadBig(name: string, content: Buffer, extra: Record<string, string> = {}) {
+    await writeFile(path.join(workspace, `${name}.bin`), content);
+    inputs({ ...connection, name, path: `${name}.bin`, 'compression-level': '0', ...extra });
+    return uploadArtifact({ retryDelayMs: 1 });
+  }
+
+  async function restored(name: string, dir: string, extra: Record<string, string> = {}) {
+    inputs({ ...connection, name, path: dir, ...extra });
+    await downloadArtifact({ retryDelayMs: 1 });
+    return readFile(path.join(workspace, dir, `${name}.bin`));
+  }
+
+  it('splits the archive into parts under the limit and reassembles it', async () => {
+    vfs.limit = LIMIT;
+    const content = randomBytes(60_000);
+    const uploaded = await uploadBig('big', content);
+
+    expect(uploaded!.parts).toBeGreaterThan(1);
+    expect(uploaded!.artifactUrl).toBe('');
+    expect(uploaded!.artifactId).toBe(vfs.files.find((f) => f.name.endsWith('.part0001'))!.file_id);
+    expect(vfs.files).toHaveLength(uploaded!.parts);
+    for (const file of vfs.files) expect(file.size).toBeLessThanOrEqual(LIMIT);
+    expect(vfs.files.map((f) => f.logicalKey).sort()[0]).toBe('artifacts/acme/web/1001/big/part-0001');
+
+    expect(Buffer.compare(await restored('big', 'out'), content)).toBe(0);
+  });
+
+  it('uploads small artifacts as a single object even when the server has a limit', async () => {
+    vfs.limit = LIMIT;
+    const uploaded = await uploadBig('small', randomBytes(2_000));
+    expect(uploaded!.parts).toBe(1);
+    expect(uploaded!.artifactUrl).toContain('/v/ci/');
+    expect(vfs.files).toHaveLength(1);
+  });
+
+  it('keeps parts with identical bytes distinct on a deduplicating server', async () => {
+    vfs.limit = LIMIT;
+    vfs.dedupe = true;
+    const content = Buffer.alloc(90_000);
+    const uploaded = await uploadBig('zeros', content);
+    expect(uploaded!.parts).toBeGreaterThan(3);
+    expect(new Set(vfs.files.map((f) => f.file_id)).size).toBe(uploaded!.parts);
+    expect(Buffer.compare(await restored('zeros', 'out'), content)).toBe(0);
+  });
+
+  it('removes parts left over when a smaller upload replaces a larger one, and the reverse', async () => {
+    vfs.limit = LIMIT;
+    const large = randomBytes(60_000);
+    await uploadBig('flip', large, { overwrite: 'true' });
+    expect(vfs.files.length).toBeGreaterThan(1);
+
+    const small = randomBytes(1_500);
+    await uploadBig('flip', small, { overwrite: 'true' });
+    expect(vfs.files).toHaveLength(1);
+    expect(Buffer.compare(await restored('flip', 'one'), small)).toBe(0);
+
+    const medium = randomBytes(30_000);
+    const again = await uploadBig('flip', medium, { overwrite: 'true' });
+    expect(vfs.files).toHaveLength(again!.parts);
+    expect(vfs.files.every((f) => f.name.includes('.part'))).toBe(true);
+    expect(Buffer.compare(await restored('flip', 'two'), medium)).toBe(0);
+  });
+
+  it('removes the parts it stored when a later part fails', async () => {
+    vfs.limit = LIMIT;
+    vfs.failPutsAfter = 1;
+    await expect(uploadBig('doomed', randomBytes(60_000))).rejects.toThrow('storage unavailable');
+    expect(vfs.files).toHaveLength(0);
+  });
+
+  it('fails before sending anything when the bucket cannot hold every part', async () => {
+    vfs.limit = LIMIT;
+    vfs.remainingFiles = 1;
+    await expect(uploadBig('crowded', randomBytes(60_000))).rejects.toThrow('room for 1 more file');
+    expect(vfs.puts).toBe(0);
+
+    vfs.remainingFiles = undefined;
+    vfs.remainingBytes = 1000;
+    await expect(uploadBig('crowded', randomBytes(60_000))).rejects.toThrow('quota left');
+    expect(vfs.puts).toBe(0);
+  });
+
+  it('explains a limit too small to split into', async () => {
+    vfs.limit = 3_000;
+    await expect(uploadBig('tiny-limit', randomBytes(20_000))).rejects.toThrow('too small');
+  });
+
+  it('downloads by artifact id and merges with other artifacts', async () => {
+    vfs.limit = LIMIT;
+    const content = randomBytes(50_000);
+    const uploaded = await uploadBig('ided', content);
+    expect(Buffer.compare(await restored('ided', 'by-id', { name: '', 'artifact-ids': uploaded!.artifactId }), content)).toBe(0);
+  });
+
+  it('treats an artifact with a missing part as not uploaded', async () => {
+    vfs.limit = LIMIT;
+    const uploaded = await uploadBig('holey', randomBytes(60_000));
+    vfs.files = vfs.files.filter((f) => !f.name.endsWith('.part0002'));
+
+    inputs({ ...connection, name: 'holey', path: 'holey-out' });
+    await expect(downloadArtifact()).rejects.toThrow('Unable to find an artifact named "holey"');
+    inputs({ ...connection, 'artifact-ids': uploaded!.artifactId, path: 'holey-out' });
+    await expect(downloadArtifact()).rejects.toThrow('incomplete');
+  });
+
+  it('detects a corrupted part', async () => {
+    vfs.limit = LIMIT;
+    await uploadBig('rotten', randomBytes(60_000));
+    const part = vfs.files.find((f) => f.name.endsWith('.part0002'))!;
+    const damaged = part.bytes.slice();
+    damaged[10_000] ^= 0xff;
+    part.bytes = damaged;
+    inputs({ ...connection, name: 'rotten', path: 'rotten-out' });
+    await expect(downloadArtifact({ retryDelayMs: 1 })).rejects.toThrow(/Checksum mismatch for part 2\//);
+  });
+
+  it('refuses parts that were swapped around', async () => {
+    vfs.limit = LIMIT;
+    await uploadBig('shuffled', randomBytes(60_000));
+    const two = vfs.files.find((f) => f.name.endsWith('.part0002'))!;
+    const three = vfs.files.find((f) => f.name.endsWith('.part0003'))!;
+    [two.bytes, three.bytes] = [three.bytes, two.bytes];
+    inputs({ ...connection, name: 'shuffled', path: 'shuffled-out' });
+    await expect(downloadArtifact({ retryDelayMs: 1 })).rejects.toThrow('does not belong to this artifact');
   });
 });

@@ -19,6 +19,13 @@ export interface FakeVFS {
   failNextPuts: number;
   // Mirrors UPLOAD_NODUPLICATED_ENABLED: an upload whose hash is already in the bucket returns that record.
   dedupe: boolean;
+  // Mirrors UPLOAD_ALLOW_SIZE: preflight and PUT refuse anything larger. 0 means no limit.
+  limit: number;
+  remainingBytes?: number;
+  remainingFiles?: number;
+  // Every PUT after this many have been accepted fails with a 503.
+  failPutsAfter?: number;
+  puts: number;
   redirectDownloadsTo?: string;
   cdn: Map<string, Uint8Array>;
   fetch: typeof fetch;
@@ -41,6 +48,8 @@ export function createFakeVFS(): FakeVFS {
     requests: [],
     failNextPuts: 0,
     dedupe: false,
+    limit: 0,
+    puts: 0,
     cdn: new Map(),
     fetch: async (input, init) => {
       const url = new URL(String(input instanceof Request ? input.url : input));
@@ -67,9 +76,17 @@ export function createFakeVFS(): FakeVFS {
       }
       if (url.pathname === '/api/upload/preflight' && method === 'POST') {
         const body = JSON.parse(String(init?.body));
-        return json({ allowed: true, bucket_id: body.bucket_id, size: body.size, max_upload_bytes: 0, upload_token: 'ticket' });
+        if (fake.limit > 0 && body.size > fake.limit) {
+          return json({ allowed: false, reason: `file is ${body.size} bytes, over the ${fake.limit} byte upload limit`, bucket_id: body.bucket_id, size: body.size, max_upload_bytes: fake.limit });
+        }
+        return json({
+          allowed: true, bucket_id: body.bucket_id, size: body.size, max_upload_bytes: fake.limit, upload_token: 'ticket',
+          ...(fake.remainingBytes !== undefined ? { remaining_bytes: fake.remainingBytes } : {}),
+          ...(fake.remainingFiles !== undefined ? { remaining_files: fake.remainingFiles } : {}),
+        });
       }
       if (url.pathname.startsWith('/api/upload/') && method === 'PUT') {
+        if (fake.failPutsAfter !== undefined && fake.puts >= fake.failPutsAfter) return json({ detail: 'storage unavailable' }, 503);
         if (fake.failNextPuts > 0) {
           fake.failNextPuts--;
           return json({ detail: 'storage unavailable' }, 503);
@@ -77,6 +94,7 @@ export function createFakeVFS(): FakeVFS {
         const [, , , bucket, ...keyParts] = url.pathname.split('/');
         const logicalKey = keyParts.join('/');
         const bytes = new Uint8Array(await new Response(init?.body as BodyInit).arrayBuffer());
+        if (fake.limit > 0 && bytes.length > fake.limit) return json({ detail: 'upload exceeds max upload size limit' }, 413);
         const hash = createHash('sha256').update(bytes).digest('hex');
         if (url.searchParams.get('file_hash') !== hash) return json({ detail: 'file_hash does not match the uploaded content' }, 400);
         if (fake.dedupe) {
@@ -97,7 +115,13 @@ export function createFakeVFS(): FakeVFS {
           bytes,
         };
         fake.files.push(file);
+        fake.puts++;
         return json(view(file));
+      }
+      const unlink = url.pathname.match(/^\/api\/upload\/unlink\/([^/]+)\/([^/]+)$/);
+      if (unlink && method === 'DELETE') {
+        fake.files = fake.files.filter((f) => !(f.bucket_id === unlink[1] && f.file_id === unlink[2]));
+        return new Response(null, { status: 204 });
       }
       const read = url.pathname.match(/^\/v\/([^/]+)\/([^/]+)$/);
       if (read && method === 'GET') {
